@@ -1006,8 +1006,12 @@ static int pty_expect_loop(void)
 		len++;
 		if (len == passwd_len) {
 			if (memcmp(buf, passwd_str, passwd_len) == 0) {
-				write(sshfs.ptyfd, sshfs.password,
+                            res = write(sshfs.ptyfd, sshfs.password,
 				      strlen(sshfs.password));
+                            if (res == -1) {
+                                perror("write");
+                                return -1;
+                            }
 			}
 			memmove(buf, buf + 1, passwd_len - 1);
 			len--;
@@ -1134,9 +1138,11 @@ static int start_ssh(void)
 		default:
 			_exit(0);
 		}
-		chdir("/");
-
-		if (sshfs.password_stdin) {
+		if (chdir("/") < 0) {
+                    perror("chdir");
+                    _exit(1);
+                }
+ 		if (sshfs.password_stdin) {
 			int sfd;
 
 			setsid();
@@ -2642,7 +2648,8 @@ static int sshfs_fsync(const char *path, int isdatasync,
 	int err;
 	(void) isdatasync;
 
-	if (err = sshfs_flush(path, fi))
+	err = sshfs_flush(path, fi);
+	if (err)
 		return err;
 
 	if (!sshfs.ext_fsync)
@@ -3952,7 +3959,6 @@ int main(int argc, char *argv[])
 		memset(sshfs_program_path, 0, PATH_MAX);
 	}
 #endif /* __APPLE__ */
-	g_thread_init(NULL);
 
 	sshfs.blksize = 4096;
 	/* SFTP spec says all servers should allow at least 32k I/O */
