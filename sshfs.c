@@ -121,6 +121,7 @@
 #define SFTP_EXT_STATVFS "statvfs@openssh.com"
 #define SFTP_EXT_HARDLINK "hardlink@openssh.com"
 #define SFTP_EXT_FSYNC "fsync@openssh.com"
+#define SFTP_EXT_FLOCK "flock@openssh.com"
 
 #define PROTO_VERSION 3
 
@@ -280,6 +281,7 @@ struct sshfs {
 	int ext_statvfs;
 	int ext_hardlink;
 	int ext_fsync;
+	int ext_flock;
 	struct fuse_operations *op;
 
 	/* statistics */
@@ -1479,6 +1481,9 @@ static int sftp_init_reply_ok(struct buffer *buf, uint32_t *version)
 			if (strcmp(ext, SFTP_EXT_FSYNC) == 0 &&
 			    strcmp(extdata, "1") == 0)
 				sshfs.ext_fsync = 1;
+			if (strcmp(ext, SFTP_EXT_FLOCK) == 0 &&
+			    strcmp(extdata, "1") == 0)
+				sshfs.ext_flock = 1;
 		} while (buf2.len < buf2.size);
 		buf_free(&buf2);
 	}
@@ -1788,7 +1793,8 @@ static int sftp_request_wait(struct request *req, uint8_t type,
 			break;
 
 		case SSH_FX_EOF:
-			if (type == SSH_FXP_READ || type == SSH_FXP_READDIR)
+			if (type == SSH_FXP_READ || type == SSH_FXP_READDIR
+                            || type == SSH_FXP_EXTENDED)
 				err = MY_EOF;
 			else
 				err = -EIO;
@@ -3297,6 +3303,29 @@ static int sshfs_truncate_workaround(const char *path, off_t size,
 	}
 }
 
+static int sshfs_flock(const char *path, struct fuse_file_info *fi, int op)
+{
+        int err;
+	struct buffer buf;
+	struct sshfs_file *sf = get_sshfs_file(fi);
+
+	(void) path;
+
+	if (!sshfs_file_is_conn(sf))
+		return -EIO;
+
+	if (!sshfs.ext_flock)
+		return -ENOSYS;
+
+	buf_init(&buf, 0);
+	buf_add_string(&buf, SFTP_EXT_FLOCK);
+	buf_add_buf(&buf, &sf->handle);
+	buf_add_uint32(&buf, op);
+
+	err = sftp_request(SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS, NULL);
+	return err == MY_EOF ? -EWOULDBLOCK : err;
+}
+
 static int processing_init(void)
 {
 	signal(SIGPIPE, SIG_IGN);
@@ -3339,6 +3368,7 @@ static struct fuse_operations sshfs_oper = {
 		.write      = sshfs_write,
 		.statfs     = sshfs_statfs,
 		.create     = sshfs_create,
+ 		.flock      = sshfs_flock,
 };
 
 static void usage(const char *progname)

@@ -556,6 +556,7 @@ static void cache_fill(struct fuse_operations *oper,
 	cache_oper->unlink   = oper->unlink ? cache_unlink : NULL;
 	cache_oper->utimens  = oper->utimens ? cache_utimens : NULL;
 	cache_oper->write    = oper->write ? cache_write : NULL;
+	cache_oper->flock    = oper->flock;
 }
 
 struct fuse_operations *cache_wrap(struct fuse_operations *oper)
