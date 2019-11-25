@@ -50,7 +50,8 @@ equivalent to '\-o ssh_protocol=1'
 reconnect to server
 .TP
 \fB\-o\fR delay_connect
-delay connection to server
+delay connection to server. Always forward file locking requests to server
+instead of probing if the server supports flock extension.
 .TP
 \fB\-o\fR sshfs_sync
 synchronous writes

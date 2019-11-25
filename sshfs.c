@@ -3694,6 +3694,10 @@ static int ssh_connect(void)
 		    sftp_check_root(sshfs.base_path) != 0)
 			return -1;
 
+		/* Use kernel implementation of flock if the remote server
+		 * doesn't support locking */
+		if (!sshfs.ext_flock)
+			sshfs_oper.oper.flock = NULL;
 	}
 	return 0;
 }
