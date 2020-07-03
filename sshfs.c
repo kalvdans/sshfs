@@ -50,6 +50,7 @@
 #  include <libgen.h>
 #  include <darwin_compat.h>
 #endif
+#include <stdbool.h>
 
 #include "cache.h"
 
@@ -161,7 +162,7 @@ typedef void (*request_func)(struct request *);
 
 struct request {
 	unsigned int want_reply;
-	sem_t ready;
+	bool ready;
 	uint8_t reply_type;
 	uint32_t id;
 	int replied;
@@ -1345,7 +1346,6 @@ static int sftp_read(uint8_t *type, struct buffer *buf)
 static void request_free(struct request *req)
 {
 	buf_free(&req->reply);
-	sem_destroy(&req->ready);
 	g_free(req);
 }
 
@@ -1384,7 +1384,7 @@ static int clean_req(void *key_, struct request *req)
 
 	req->error = -EIO;
 	if (req->want_reply)
-		sem_post(&req->ready);
+		req->ready = true;
 	else {
 		if (req->end_func)
 			req->end_func(req);
@@ -1449,7 +1449,7 @@ static int process_one_request(void)
 		req->reply_type = type;
 		req->replied = 1;
 		if (req->want_reply)
-			sem_post(&req->ready);
+			req->ready = true;
 		else {
 			if (req->end_func) {
 				pthread_mutex_lock(&sshfs.lock);
@@ -1791,7 +1791,6 @@ static int connect_remote(void)
 static int start_processing_thread(void)
 {
 	int err;
-	pthread_t thread_id;
 	sigset_t oldset;
 	sigset_t newset;
 
@@ -1815,12 +1814,6 @@ static int start_processing_thread(void)
 	sigaddset(&newset, SIGHUP);
 	sigaddset(&newset, SIGQUIT);
 	pthread_sigmask(SIG_BLOCK, &newset, &oldset);
-	err = pthread_create(&thread_id, NULL, process_requests, NULL);
-	if (err) {
-		fprintf(stderr, "failed to create thread: %s\n", strerror(err));
-		return -EIO;
-	}
-	pthread_detach(thread_id);
 	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 	sshfs.processing_thread_started = 1;
 	return 0;
@@ -1853,7 +1846,10 @@ static int sftp_request_wait(struct request *req, uint8_t type,
 		err = req->error;
 		goto out;
 	}
-	while (sem_wait(&req->ready));
+	while (!req->ready) {
+            if (process_one_request() == -1)
+                goto out;
+        }
 	if (req->error) {
 		err = req->error;
 		goto out;
@@ -1923,7 +1919,7 @@ static int sftp_request_send(uint8_t type, struct iovec *iov, size_t count,
 	req->want_reply = want_reply;
 	req->end_func = end_func;
 	req->data = data;
-	sem_init(&req->ready, 0, 0);
+        req->ready = false;
 	buf_init(&req->reply, 0);
 	pthread_mutex_lock(&sshfs.lock);
 	if (begin_func)
