@@ -25,10 +25,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
-#ifndef __APPLE__
-#  include <semaphore.h>
-#endif
-#include <pthread.h>
 #include <netdb.h>
 #include <signal.h>
 #include <sys/uio.h>
@@ -248,8 +244,6 @@ struct sshfs {
 	char *host;
 	char *base_path;
 	GHashTable *reqtab;
-	pthread_mutex_t lock;
-	pthread_mutex_t lock_write;
 	int processing_thread_started;
 	unsigned int randseed;
 	int rfd;
@@ -270,7 +264,6 @@ struct sshfs {
 	long modifver;
 	unsigned outstanding_len;
 	unsigned max_outstanding_len;
-	pthread_cond_t outstanding_cond;
 	int password_stdin;
 	char *password;
 	int ext_posix_rename;
@@ -1291,9 +1284,7 @@ static int sftp_send_iov(uint8_t type, uint32_t id, struct iovec iov[],
 	buf_to_iov(&buf, &iovout[nout++]);
 	for (i = 0; i < count; i++)
 		iovout[nout++] = iov[i];
-	pthread_mutex_lock(&sshfs.lock_write);
 	res = do_write(iovout, nout);
-	pthread_mutex_unlock(&sshfs.lock_write);
 	buf_free(&buf);
 	return res;
 }
@@ -1371,9 +1362,7 @@ static void chunk_put(struct read_chunk *chunk)
 
 static void chunk_put_locked(struct read_chunk *chunk)
 {
-	pthread_mutex_lock(&sshfs.lock);
 	chunk_put(chunk);
-	pthread_mutex_unlock(&sshfs.lock);
 }
 
 static int clean_req(void *key_, struct request *req)
@@ -1406,7 +1395,6 @@ static int process_one_request(void)
 	if (buf_get_uint32(&buf, &id) == -1)
 		return -1;
 
-	pthread_mutex_lock(&sshfs.lock);
 	req = (struct request *)
 		g_hash_table_lookup(sshfs.reqtab, GUINT_TO_POINTER(id));
 	if (req == NULL)
@@ -1418,11 +1406,9 @@ static int process_one_request(void)
 		sshfs.outstanding_len -= req->len;
 		if (was_over &&
 		    sshfs.outstanding_len <= sshfs.max_outstanding_len) {
-			pthread_cond_broadcast(&sshfs.outstanding_cond);
 		}
 		g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
 	}
-	pthread_mutex_unlock(&sshfs.lock);
 	if (req != NULL) {
 		if (sshfs.debug) {
 			struct timeval now;
@@ -1450,9 +1436,7 @@ static int process_one_request(void)
 			req->ready = true;
 		else {
 			if (req->end_func) {
-				pthread_mutex_lock(&sshfs.lock);
 				req->end_func(req);
-				pthread_mutex_unlock(&sshfs.lock);
 			}
 			request_free(req);
 		}
@@ -1484,14 +1468,11 @@ static void process_requests(void)
         if (process_one_request() != -1)
             return;
 
-	pthread_mutex_lock(&sshfs.lock);
 	sshfs.processing_thread_started = 0;
 	close_conn();
 	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, NULL);
 	sshfs.connver ++;
 	sshfs.outstanding_len = 0;
-	pthread_cond_broadcast(&sshfs.outstanding_cond);
-	pthread_mutex_unlock(&sshfs.lock);
 
 	if (!sshfs.reconnect) {
 		/* harakiri */
@@ -1784,8 +1765,6 @@ static int connect_remote(void)
 static int start_processing_thread(void)
 {
 	int err;
-	sigset_t oldset;
-	sigset_t newset;
 
 	if (sshfs.processing_thread_started)
 		return 0;
@@ -1801,13 +1780,6 @@ static int start_processing_thread(void)
 		sshfs.detect_uid = 0;
 	}
 
-	sigemptyset(&newset);
-	sigaddset(&newset, SIGTERM);
-	sigaddset(&newset, SIGINT);
-	sigaddset(&newset, SIGHUP);
-	sigaddset(&newset, SIGQUIT);
-	pthread_sigmask(SIG_BLOCK, &newset, &oldset);
-	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 	sshfs.processing_thread_started = 1;
 	return 0;
 }
@@ -1891,9 +1863,7 @@ static int sftp_request_wait(struct request *req, uint8_t type,
 
 out:
 	if (req->end_func) {
-		pthread_mutex_lock(&sshfs.lock);
 		req->end_func(req);
-		pthread_mutex_unlock(&sshfs.lock);
 	}
 	request_free(req);
 	return err;
@@ -1913,20 +1883,16 @@ static int sftp_request_send(uint8_t type, struct iovec *iov, size_t count,
 	req->data = data;
         req->ready = false;
 	buf_init(&req->reply, 0);
-	pthread_mutex_lock(&sshfs.lock);
 	if (begin_func)
 		begin_func(req);
 	id = sftp_get_id();
 	req->id = id;
 	err = start_processing_thread();
 	if (err) {
-		pthread_mutex_unlock(&sshfs.lock);
 		goto out;
 	}
 	req->len = iov_length(iov, count) + 9;
 	sshfs.outstanding_len += req->len;
-	while (sshfs.outstanding_len > sshfs.max_outstanding_len)
-		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
 
 	g_hash_table_insert(sshfs.reqtab, GUINT_TO_POINTER(id), req);
 	if (sshfs.debug) {
@@ -1935,15 +1901,12 @@ static int sftp_request_send(uint8_t type, struct iovec *iov, size_t count,
 		sshfs.bytes_sent += req->len;
 	}
 	DEBUG("[%05i] %s\n", id, type_name(type));
-	pthread_mutex_unlock(&sshfs.lock);
 
 	err = -EIO;
 	if (sftp_send_iov(type, id, iov, count) == -1) {
 		gboolean rmed;
 
-		pthread_mutex_lock(&sshfs.lock);
 		rmed = g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
-		pthread_mutex_unlock(&sshfs.lock);
 
 		if (!rmed && !want_reply) {
 			/* request already freed */
@@ -2175,10 +2138,8 @@ static int sftp_readdir_async(struct buffer *handle, fuse_cache_dirh_t h,
 			outstanding--;
 
 			if (done) {
-				pthread_mutex_lock(&sshfs.lock);
 				if (sshfs_req_pending(req))
 					req->want_reply = 0;
-				pthread_mutex_unlock(&sshfs.lock);
 				if (!req->want_reply)
 					continue;
 			}
@@ -2468,9 +2429,7 @@ static int sshfs_truncate_workaround(const char *path, off_t size,
 
 static void sshfs_inc_modifver(void)
 {
-	pthread_mutex_lock(&sshfs.lock);
 	sshfs.modifver++;
-	pthread_mutex_unlock(&sshfs.lock);
 }
 
 static int sshfs_truncate(const char *path, off_t size)
@@ -2509,9 +2468,7 @@ static inline int sshfs_file_is_conn(struct sshfs_file *sf)
 {
 	int ret;
 
-	pthread_mutex_lock(&sshfs.lock);
 	ret = (sf->connver == sshfs.connver);
-	pthread_mutex_unlock(&sshfs.lock);
 
 	return ret;
 }
@@ -2555,10 +2512,8 @@ static int sshfs_open_common(const char *path, mode_t mode,
 	sf->is_seq = 0;
 	sf->refs = 1;
 	sf->next_pos = 0;
-	pthread_mutex_lock(&sshfs.lock);
 	sf->modifver= sshfs.modifver;
 	sf->connver = sshfs.connver;
-	pthread_mutex_unlock(&sshfs.lock);
 	buf_init(&buf, 0);
 	buf_add_path(&buf, path);
 	buf_add_uint32(&buf, pflags);
@@ -2620,7 +2575,6 @@ static int sshfs_flush(const char *path, struct fuse_file_info *fi)
 		return 0;
 
 	(void) path;
-	pthread_mutex_lock(&sshfs.lock);
 	if (!list_empty(&sf->write_reqs)) {
 		curr_list = sf->write_reqs.prev;
 		list_del(&sf->write_reqs);
@@ -2631,7 +2585,6 @@ static int sshfs_flush(const char *path, struct fuse_file_info *fi)
 	}
 	err = sf->write_error;
 	sf->write_error = 0;
-	pthread_mutex_unlock(&sshfs.lock);
 	return err;
 }
 
@@ -2779,10 +2732,8 @@ static int wait_chunk(struct read_chunk *chunk, char *buf, size_t size)
 	int res = 0;
 	struct read_req *rreq;
 
-	pthread_mutex_lock(&sshfs.lock);
 	while (chunk->sio.num_reqs)
             process_requests();
-	pthread_mutex_unlock(&sshfs.lock);
 
 
 	if (chunk->sio.error) {
@@ -2847,12 +2798,10 @@ static void submit_read(struct sshfs_file *sf, size_t size, off_t offset,
 	struct read_chunk *chunk;
 
 	chunk = sshfs_send_read(sf, size, offset);
-	pthread_mutex_lock(&sshfs.lock);
 	chunk->modifver = sshfs.modifver;
 	chunk_put(*chunkp);
 	*chunkp = chunk;
 	chunk->refs++;
-	pthread_mutex_unlock(&sshfs.lock);
 }
 
 static struct read_chunk *search_read_chunk(struct sshfs_file *sf, off_t offset)
@@ -2875,13 +2824,11 @@ static int sshfs_async_read(struct sshfs_file *sf, char *rbuf, size_t size,
 	size_t origsize = size;
 	int curr_is_seq;
 
-	pthread_mutex_lock(&sshfs.lock);
 	curr_is_seq = sf->is_seq;
 	sf->is_seq = (sf->next_pos == offset && sf->modifver == sshfs.modifver);
 	sf->next_pos = offset + size;
 	sf->modifver = sshfs.modifver;
 	chunk = search_read_chunk(sf, offset);
-	pthread_mutex_unlock(&sshfs.lock);
 
 	if (chunk && chunk->size < size) {
 		chunk_prev = chunk;
@@ -3041,10 +2988,8 @@ static int sshfs_sync_write(struct sshfs_file *sf, const char *wbuf,
 		offset += bsize;
 	}
 
-	pthread_mutex_lock(&sshfs.lock);
 	while (sio.num_reqs)
             process_requests();
-	pthread_mutex_unlock(&sshfs.lock);
 
 	if (!err)
 		err = sio.error;
@@ -3350,9 +3295,6 @@ static int processing_init(void)
 {
 	signal(SIGPIPE, SIG_IGN);
 
-	pthread_mutex_init(&sshfs.lock, NULL);
-	pthread_mutex_init(&sshfs.lock_write, NULL);
-	pthread_cond_init(&sshfs.outstanding_cond, NULL);
 	sshfs.reqtab = g_hash_table_new(NULL, NULL);
 	if (!sshfs.reqtab) {
 		fprintf(stderr, "failed to create hash table\n");
