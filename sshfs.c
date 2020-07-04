@@ -177,7 +177,6 @@ struct request {
 
 struct sshfs_io {
 	int num_reqs;
-	pthread_cond_t finished;
 	int error;
 };
 
@@ -201,7 +200,6 @@ struct read_chunk {
 struct sshfs_file {
 	struct buffer handle;
 	struct list_head write_reqs;
-	pthread_cond_t write_finished;
 	int write_error;
 	struct read_chunk *readahead;
 	off_t next_pos;
@@ -1481,14 +1479,10 @@ static void close_conn(void)
 	}
 }
 
-static void *process_requests(void *data_)
+static void process_requests(void)
 {
-	(void) data_;
-
-	while (1) {
-		if (process_one_request() == -1)
-			break;
-	}
+        if (process_one_request() != -1)
+            return;
 
 	pthread_mutex_lock(&sshfs.lock);
 	sshfs.processing_thread_started = 0;
@@ -1503,7 +1497,6 @@ static void *process_requests(void *data_)
 		/* harakiri */
 		kill(getpid(), SIGTERM);
 	}
-	return NULL;
 }
 
 static int sftp_init_reply_ok(struct buffer *buf, uint32_t *version)
@@ -1847,8 +1840,7 @@ static int sftp_request_wait(struct request *req, uint8_t type,
 		goto out;
 	}
 	while (!req->ready) {
-            if (process_one_request() == -1)
-                goto out;
+            process_requests();
         }
 	if (req->error) {
 		err = req->error;
@@ -2559,7 +2551,6 @@ static int sshfs_open_common(const char *path, mode_t mode,
 
 	sf = g_new0(struct sshfs_file, 1);
 	list_init(&sf->write_reqs);
-	pthread_cond_init(&sf->write_finished, NULL);
 	/* Assume random read after open */
 	sf->is_seq = 0;
 	sf->refs = 1;
@@ -2636,7 +2627,7 @@ static int sshfs_flush(const char *path, struct fuse_file_info *fi)
 		list_init(&sf->write_reqs);
 		list_add(&write_reqs, curr_list);
 		while (!list_empty(&write_reqs))
-			pthread_cond_wait(&sf->write_finished, &sshfs.lock);
+                    process_requests();
 	}
 	err = sf->write_error;
 	sf->write_error = 0;
@@ -2730,8 +2721,6 @@ static void sshfs_read_end(struct request *req)
 	}
 
 	rreq->sio->num_reqs--;
-	if (!rreq->sio->num_reqs)
-		pthread_cond_broadcast(&rreq->sio->finished);
 }
 
 static void sshfs_read_begin(struct request *req)
@@ -2746,7 +2735,6 @@ static struct read_chunk *sshfs_send_read(struct sshfs_file *sf, size_t size,
 	struct read_chunk *chunk = g_new0(struct read_chunk, 1);
 	struct buffer *handle = &sf->handle;
 
-	pthread_cond_init(&chunk->sio.finished, NULL);
 	list_init(&chunk->reqs);
 	chunk->size = size;
 	chunk->offset = offset;
@@ -2793,7 +2781,7 @@ static int wait_chunk(struct read_chunk *chunk, char *buf, size_t size)
 
 	pthread_mutex_lock(&sshfs.lock);
 	while (chunk->sio.num_reqs)
-	       pthread_cond_wait(&chunk->sio.finished, &sshfs.lock);
+            process_requests();
 	pthread_mutex_unlock(&sshfs.lock);
 
 
@@ -2966,7 +2954,6 @@ static void sshfs_write_end(struct request *req)
 		}
 	}
 	list_del(&req->list);
-	pthread_cond_broadcast(&sf->write_finished);
 	sshfs_file_put(sf);
 }
 
@@ -3022,8 +3009,6 @@ static void sshfs_sync_write_end(struct request *req)
 		}
 	}
 	sio->num_reqs--;
-	if (!sio->num_reqs)
-		pthread_cond_broadcast(&sio->finished);
 }
 
 
@@ -3033,8 +3018,6 @@ static int sshfs_sync_write(struct sshfs_file *sf, const char *wbuf,
 	int err = 0;
 	struct buffer *handle = &sf->handle;
 	struct sshfs_io sio = { .error = 0, .num_reqs = 0 };
-
-	pthread_cond_init(&sio.finished, NULL);
 
 	while (!err && size) {
 		struct buffer buf;
@@ -3060,7 +3043,7 @@ static int sshfs_sync_write(struct sshfs_file *sf, const char *wbuf,
 
 	pthread_mutex_lock(&sshfs.lock);
 	while (sio.num_reqs)
-	       pthread_cond_wait(&sio.finished, &sshfs.lock);
+            process_requests();
 	pthread_mutex_unlock(&sshfs.lock);
 
 	if (!err)
